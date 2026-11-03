@@ -1,0 +1,30 @@
+[tools]
+go = "1.27.3"
+
+[tasks.setup]
+description = "Prepare Go module dependencies"
+run = "go mod download"
+
+[tasks.fmt]
+description = "Format Go source files"
+run = "gofmt -w favicon.go favicon_test.go"
+
+[tasks.lint]
+description = "Run Go vet and Staticcheck"
+run = "go vet ./... && go tool staticcheck ./..."
+
+[tasks.vuln]
+description = "Check Go dependencies for known vulnerabilities"
+run = "go tool govulncheck ./..."
+
+[tasks.test]
+description = "Run Go tests"
+run = "go test ./..."
+
+[tasks.test-race]
+description = "Run Go tests with the race detector"
+run = "go test -race ./..."
+
+[tasks.check]
+description = "Run formatting checks, lint, and tests"
+run = "gofmt -d favicon.go favicon_test.go && go vet ./... && go tool staticcheck ./... && go test ./..."
