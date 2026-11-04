@@ -5,12 +5,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"image"
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"path"
@@ -32,6 +34,8 @@ const (
 	defaultUserAgent  = "go.lucor.dev/favicon"
 )
 
+var discardLogger = slog.New(slog.DiscardHandler)
+
 // Options configures HTTP requests made while discovering or downloading an icon.
 type Options struct {
 	// Client is the HTTP client to use. A nil client uses a five-second timeout.
@@ -42,6 +46,26 @@ type Options struct {
 	// Download discovers an icon and does not use these validators.
 	ETag         string
 	LastModified string
+	// Logger is used for diagnostic logging. If nil, logging is disabled.
+	Logger *slog.Logger
+}
+
+// WithLogger returns a copy of Options configured with the specified logger.
+func (o Options) WithLogger(logger *slog.Logger) Options {
+	o.Logger = logger
+	return o
+}
+
+// WithLogger returns Options configured with the specified logger.
+func WithLogger(logger *slog.Logger) Options {
+	return Options{Logger: logger}
+}
+
+func (o Options) logger() *slog.Logger {
+	if o.Logger == nil {
+		return discardLogger
+	}
+	return o.Logger
 }
 
 // DownloadResult describes a downloaded icon and its HTTP cache validators.
@@ -80,17 +104,64 @@ func Download(ctx context.Context, u *url.URL, opts Options) (DownloadResult, er
 		return DownloadResult{}, fmt.Errorf("invalid page URL: %w", err)
 	}
 	client := requestClient(opts.Client)
-	iconData, baseURL, err := findFavicon(ctx, client, &pageURL, opts.UserAgent)
-	if err != nil {
-		return DownloadResult{}, fmt.Errorf("find favicon: %w", err)
+	logger := opts.logger()
+	pageOrigin := pageURL
+	pageOrigin.Path, pageOrigin.RawPath, pageOrigin.RawQuery, pageOrigin.Fragment = "", "", "", ""
+	tried := make(map[string]bool)
+	var failures []error
+	try := func(raw, source string) (DownloadResult, bool) {
+		parsed, parseErr := url.Parse(raw)
+		if parseErr == nil {
+			key := safeURL(parsed)
+			if tried[key] {
+				logger.DebugContext(ctx, "favicon URL already attempted", "url", key, "source", source, "reason", "duplicate")
+				return DownloadResult{}, false
+			}
+			tried[key] = true
+		}
+		result, e := downloadURL(ctx, client, raw, Options{UserAgent: opts.UserAgent, Logger: logger})
+		if e != nil {
+			logger.DebugContext(ctx, "favicon attempt failed", "url", safeURL(parsed), "source", source, "error", e)
+			failures = append(failures, fmt.Errorf("%s: %w", source, e))
+			return DownloadResult{}, false
+		}
+		logger.DebugContext(ctx, "favicon selected", "url", safeURL(parsed), "source", source, "format", result.Icon.Format)
+		return result, true
 	}
-	iconURL := iconData.MakeRawURL(baseURL)
-	return downloadURL(ctx, client, iconURL, Options{UserAgent: opts.UserAgent})
+	data, base, err := findFavicon(ctx, client, &pageURL, opts.UserAgent, logger)
+	if err != nil {
+		logger.DebugContext(ctx, "HTML discovery failed", "url", safeURL(&pageURL), "source", "html", "error", err)
+		failures = append(failures, fmt.Errorf("HTML discovery: %w", err))
+	} else if ctx.Err() != nil {
+		return DownloadResult{}, ctx.Err()
+	} else if result, ok := try(data.MakeRawURL(base), "html"); ok {
+		return result, nil
+	}
+	if ctx.Err() != nil {
+		return DownloadResult{}, ctx.Err()
+	}
+	logger.DebugContext(ctx, "trying favicon fallbacks", "source", "fallback", "reason", "HTML icon unavailable")
+	for _, p := range []string{"/apple-touch-icon.png", "/favicon.ico"} {
+		target := pageOrigin.ResolveReference(&url.URL{Path: p}).String()
+		logger.DebugContext(ctx, "trying favicon fallback", "url", safeURL(mustParseURL(target)), "source", "fallback")
+		if result, ok := try(target, "fallback"); ok {
+			return result, nil
+		}
+		if ctx.Err() != nil {
+			return DownloadResult{}, ctx.Err()
+		}
+	}
+	return DownloadResult{}, fmt.Errorf("all favicon attempts failed: %w", errors.Join(failures...))
 }
+
+func mustParseURL(raw string) *url.URL { u, _ := url.Parse(raw); return u }
 
 // DownloadURL downloads and decodes an icon from a direct URL.
 func DownloadURL(ctx context.Context, rawURL string, opts Options) (DownloadResult, error) {
 	client := requestClient(opts.Client)
+	if opts.Logger == nil {
+		opts.Logger = discardLogger
+	}
 	return downloadURL(ctx, client, rawURL, opts)
 }
 
@@ -119,10 +190,10 @@ func requestClient(client *http.Client) *http.Client {
 	return &copy
 }
 
-// validateURL accepts only well-formed HTTP and HTTPS URLs with a host.
+// validateURL accepts only well-formed HTTPS URLs with a host.
 func validateURL(u *url.URL) error {
-	if u == nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
-		return fmt.Errorf("URL must use HTTP or HTTPS and include a host")
+	if u == nil || u.Scheme != "https" || u.Hostname() == "" {
+		return fmt.Errorf("URL must use HTTPS and include a host")
 	}
 	if _, err := url.ParseRequestURI(u.String()); err != nil {
 		return fmt.Errorf("malformed URL: %w", err)
@@ -132,6 +203,7 @@ func validateURL(u *url.URL) error {
 
 // downloadURL fetches an icon, handles conditional responses, and decodes its body.
 func downloadURL(ctx context.Context, client *http.Client, rawURL string, opts Options) (DownloadResult, error) {
+	logger := opts.logger()
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return DownloadResult{}, fmt.Errorf("invalid favicon URL: %w", err)
@@ -141,6 +213,7 @@ func downloadURL(ctx context.Context, client *http.Client, rawURL string, opts O
 	}
 	res, err := makeRequest(ctx, client, u.String(), opts)
 	if err != nil {
+		logger.DebugContext(ctx, "favicon request failed", "url", safeURL(u), "source", "icon", "error", err)
 		return DownloadResult{}, fmt.Errorf("download favicon: %w", err)
 	}
 	defer res.Body.Close()
@@ -168,6 +241,7 @@ func downloadURL(ctx context.Context, client *http.Client, rawURL string, opts O
 		return DownloadResult{}, fmt.Errorf("decode favicon with Content-Type %q: %w", contentType, err)
 	}
 	result.Icon = icon
+	logger.DebugContext(ctx, "favicon selected", "url", safeURL(res.Request.URL), "source", "download", "format", icon.Format)
 	return result, nil
 }
 
@@ -267,6 +341,7 @@ func makeRequest(ctx context.Context, client *http.Client, rawURL string, opts O
 	if opts.LastModified != "" {
 		req.Header.Set("If-Modified-Since", opts.LastModified)
 	}
+	opts.logger().DebugContext(ctx, "HTTP request", "url", safeURL(u), "method", http.MethodGet)
 	res, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetch URL: %w", err)
@@ -276,12 +351,22 @@ func makeRequest(ctx context.Context, client *http.Client, rawURL string, opts O
 		defer res.Body.Close()
 		return nil, fmt.Errorf("HTTP %d: %s", res.StatusCode, res.Status)
 	}
+	opts.logger().DebugContext(ctx, "HTTP response", "url", safeURL(res.Request.URL), "status", res.StatusCode)
 	return res, nil
 }
 
+func safeURL(u *url.URL) string {
+	copy := *u
+	copy.User = nil
+	copy.RawQuery = ""
+	copy.ForceQuery = false
+	return copy.String()
+}
+
 // findFavicon parses the page and selects a valid linked icon or the standard fallback.
-func findFavicon(ctx context.Context, client *http.Client, u *url.URL, userAgent string) (*faviconData, *url.URL, error) {
-	res, err := makeRequest(ctx, client, u.String(), Options{UserAgent: userAgent})
+func findFavicon(ctx context.Context, client *http.Client, u *url.URL, userAgent string, logger *slog.Logger) (*faviconData, *url.URL, error) {
+	logger.DebugContext(ctx, "discovering favicon from HTML", "url", safeURL(u), "source", "html")
+	res, err := makeRequest(ctx, client, u.String(), Options{UserAgent: userAgent, Logger: logger})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -293,22 +378,27 @@ func findFavicon(ctx context.Context, client *http.Client, u *url.URL, userAgent
 	baseURL := res.Request.URL
 	favicons := parseHeadSection(bytes.NewReader(page))
 	if len(favicons) == 0 {
+		logger.DebugContext(ctx, "using favicon fallback", "source", "fallback", "reason", "no candidates")
 		return &faviconData{href: "/favicon.ico", rel: "icon", mime: "image/x-icon"}, baseURL, nil
 	}
 	for i := len(favicons) - 1; i >= 0; i-- {
 		candidateURL, err := url.Parse(favicons[i].href)
 		if err != nil {
+			logger.DebugContext(ctx, "discarding favicon candidate", "source", "html", "reason", "invalid URL")
 			favicons = append(favicons[:i], favicons[i+1:]...)
 			continue
 		}
 		resolved := baseURL.ResolveReference(candidateURL)
 		if validateURL(resolved) != nil {
+			logger.DebugContext(ctx, "discarding favicon candidate", "url", safeURL(resolved), "source", "html", "reason", "unsupported URL")
 			favicons = append(favicons[:i], favicons[i+1:]...)
 		}
 	}
 	if len(favicons) == 0 {
+		logger.DebugContext(ctx, "using favicon fallback", "source", "fallback", "reason", "no valid candidates")
 		return &faviconData{href: "/favicon.ico", rel: "icon", mime: "image/x-icon"}, baseURL, nil
 	}
+	logger.DebugContext(ctx, "favicon candidates discovered", "source", "html", "count", len(favicons))
 	return findBetterSize(favicons), baseURL, nil
 }
 

@@ -10,6 +10,17 @@ Install it with:
 go get go.lucor.dev/favicon
 ```
 
+The diagnostic CLI downloads a favicon to a file. Raster images are saved as
+PNG and SVG data is preserved as SVG. Add `-debug` to print discovery and
+download diagnostics to standard error:
+
+```console
+go run ./cmd/favicon -debug -output favicon.png https://example.com
+```
+
+The output path defaults to `favicon.png` for raster images and `favicon.svg`
+for SVG. Use `-output` to choose another path.
+
 Discover an icon from a page:
 
 ```go

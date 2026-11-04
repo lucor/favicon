@@ -9,6 +9,7 @@ import (
 	"image/gif"
 	"image/jpeg"
 	"image/png"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -27,7 +28,7 @@ func pngData(t *testing.T, size int) []byte {
 
 func TestDownloadDiscoversRelativeIconAndRedirectURL(t *testing.T) {
 	icon := pngData(t, 16)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/start":
 			http.Redirect(w, r, "/dir/page", http.StatusFound)
@@ -65,7 +66,7 @@ func TestDownloadFallbackAndSelection(t *testing.T) {
 		{"largest png", `<head><link rel="icon" href="small.png" sizes="16x16"><link rel="icon" href="large.png" sizes="64x64"></head>`, "/large.png"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == "/" {
 					_, _ = w.Write([]byte(tc.html))
 					return
@@ -89,9 +90,32 @@ func TestDownloadFallbackAndSelection(t *testing.T) {
 	}
 }
 
+func TestDownloadDiagnosticLogging(t *testing.T) {
+	icon := pngData(t, 2)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			_, _ = w.Write([]byte(`<head><link rel="icon" href="/icon.png"></head>`))
+			return
+		}
+		_, _ = w.Write(icon)
+	}))
+	defer server.Close()
+	u, _ := url.Parse(server.URL)
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	if _, err := Download(context.Background(), u, Options{Client: server.Client()}.WithLogger(logger)); err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range []string{"discovering favicon from HTML", "HTTP request", "favicon selected"} {
+		if !strings.Contains(logs.String(), event) {
+			t.Errorf("missing log event %q", event)
+		}
+	}
+}
+
 func TestUserAgent(t *testing.T) {
 	for _, tc := range []struct{ input, want string }{{"custom-agent", "custom-agent"}, {"", defaultUserAgent}} {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if got := r.UserAgent(); got != tc.want {
 				t.Errorf("User-Agent = %q, want %q", got, tc.want)
 			}
@@ -122,7 +146,7 @@ func TestConditionalRequests(t *testing.T) {
 		{name: "unexpected", status: http.StatusForbidden, etag: `"v1"`, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Header.Get("If-None-Match") != tc.etag || r.Header.Get("If-Modified-Since") != tc.lastModified {
 					t.Errorf("validators = %v", r.Header)
 				}
@@ -221,12 +245,12 @@ func TestDecodeSVGValidation(t *testing.T) {
 }
 
 func TestRejectURLAndRedirectSchemes(t *testing.T) {
-	for _, raw := range []string{"ftp://example.com/icon", "http:///missing", "://broken"} {
+	for _, raw := range []string{"ftp://example.com/icon", "http://example.com/icon", "http:///missing", "://broken"} {
 		if _, err := DownloadURL(context.Background(), raw, Options{}); err == nil {
 			t.Errorf("DownloadURL(%q) succeeded", raw)
 		}
 	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Location", "file:///tmp/x")
 		w.WriteHeader(http.StatusFound)
 	}))
@@ -237,7 +261,7 @@ func TestRejectURLAndRedirectSchemes(t *testing.T) {
 }
 
 func TestLimitsAndCancellation(t *testing.T) {
-	oversized := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	oversized := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(bytes.Repeat([]byte("x"), maxIconBytes+1))
 	}))
 	defer oversized.Close()
@@ -245,7 +269,7 @@ func TestLimitsAndCancellation(t *testing.T) {
 		t.Fatal("oversized response accepted")
 	}
 
-	htmlServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	htmlServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(append([]byte(`<head></head>`), bytes.Repeat([]byte("x"), maxHTMLBytes)...))
 	}))
 	defer htmlServer.Close()
@@ -265,14 +289,14 @@ func TestLimitsAndCancellation(t *testing.T) {
 }
 
 func TestDownloadDoesNotMutateInputURLOrClient(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(pngData(t, 1)) }))
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(pngData(t, 1)) }))
 	defer server.Close()
-	u, _ := url.Parse(strings.TrimPrefix(server.URL, "http:"))
+	u, _ := url.Parse(strings.TrimPrefix(server.URL, "https:"))
 	before := *u
 	client := server.Client()
 	checkRedirect := client.CheckRedirect
-	if _, err := Download(context.Background(), u, Options{Client: client}); err == nil {
-		t.Fatal("scheme-less URL should default to HTTPS and fail against HTTP server")
+	if _, err := Download(context.Background(), u, Options{Client: client}); err != nil {
+		t.Fatalf("scheme-less URL should default to HTTPS: %v", err)
 	}
 	if *u != before {
 		t.Fatalf("URL mutated: got %+v want %+v", *u, before)
