@@ -1,45 +1,36 @@
 # favicon
 
-`go.lucor.dev/favicon` discovers website favicon links, downloads the selected
-icon, and decodes raster images. It supports PNG, JPEG, ICO, GIF, and WebP
-raster images, plus SVG bytes without rendering them.
+[![Go Reference](https://pkg.go.dev/badge/go.lucor.dev/favicon.svg)](https://pkg.go.dev/go.lucor.dev/favicon)
+[![Dependencies](https://badges.api.sourcespotter.com/deps?package=go.lucor.dev%2Ffavicon)](https://sourcespotter.com/deps/?package=go.lucor.dev%2Ffavicon)
 
-Install it with:
+Find and download a website's favicon with Go.
 
-```console
+```sh
 go get go.lucor.dev/favicon
 ```
 
-The diagnostic CLI downloads a favicon to a file. Raster images are saved as
-PNG and SVG data is preserved as SVG. Add `-debug` to print discovery and
-download diagnostics to standard error:
-
-```console
-go run ./cmd/favicon -debug -output favicon.png https://example.com
-```
-
-The output path defaults to `favicon.png` for raster images and `favicon.svg`
-for SVG. Use `-output` to choose another path.
-
-Discover an icon from a page:
+Pass a page URL to `Download`. URLs without a scheme use HTTPS; HTTP URLs are
+not supported.
 
 ```go
 import (
- "context"
- "net/url"
+    "context"
+    "net/url"
 
- "go.lucor.dev/favicon"
+    "go.lucor.dev/favicon"
 )
 
 func discover(ctx context.Context) error {
-    page, err := url.Parse("https://example.com/")
+    page, err := url.Parse("https://example.com")
     if err != nil {
         return err
     }
+
     result, err := favicon.Download(ctx, page, favicon.Options{})
     if err != nil {
         return err
     }
+
     if result.Icon.Raster != nil {
         // Use the decoded image.
     }
@@ -47,35 +38,20 @@ func discover(ctx context.Context) error {
 }
 ```
 
-Download a known icon and validate it on a later request:
+The package supports PNG, JPEG, ICO, GIF, WebP, and SVG. SVG is returned as-is;
+it is not rendered or sanitized. Requests have a five-second timeout by default.
 
-```go
-previous := result // Keep the result from an earlier request.
-result, err := favicon.DownloadURL(ctx, iconURL, favicon.Options{
- ETag:         previous.ETag,
- LastModified: previous.LastModified,
-})
-if err != nil {
- return err
-}
-if result.NotModified {
- // Keep the previously downloaded icon.
-}
+## CLI
+
+The diagnostic command saves raster icons as PNG and SVG icons as SVG:
+
+```sh
+go run ./cmd/favicon -debug -output favicon.png https://example.com
 ```
 
-Raster results are available in `Icon.Raster`, with their format and dimensions
-in `Format` and `Size`. SVG results preserve the original bytes in `Icon.SVG`;
-SVG input must be well-formed XML with a single SVG root element. The library
-does not render or sanitize SVG content.
+`-output` is optional. The default filename is `favicon.png` for raster icons
+and `favicon.svg` for SVG. Diagnostic logs go to standard error.
 
-Requests use a five-second timeout by default. HTML is limited to 1 MiB, icon
-responses to 2 MiB, and raster images to 4096 pixels per dimension and
-16,777,216 pixels total. A custom HTTP client and User-Agent can be supplied
-in `Options`.
+## License
 
-ICO parsing is delegated to the image decoder. Dimension checks use its
-reported configuration and decoded result; they do not bound the decoder's
-internal allocations or validate every embedded image before decoding.
-
-The library does not provide persistent caching, resizing, image rendering, or
-application-specific storage.
+MIT. See [LICENSE](LICENSE).
